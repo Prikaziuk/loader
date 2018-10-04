@@ -1,13 +1,13 @@
+import argparse
 import hashlib
 import io
 import os
 import re
-import requests
 import shutil
-import sqlite3
-import time
 import zipfile
 
+from get_request import get_request
+from LoaderDB import LoaderDB
 from url_config import get_urls_and_query
 
 # from logger_pkg import configure_logger
@@ -18,9 +18,44 @@ from url_config import get_urls_and_query
 # if you don't have logger_pkg - use standard logging
 import logging
 # # if you want to control logs uncomment all lines
-# import sys
-# logging.basicConfig(stream=sys.stdout, level=logging.INFO)  # default logging.WARNING
+import sys
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)  # default logging.WARNING
 logger = logging.getLogger()
+
+RUN_FROM_CLI = True
+
+# if RUN_FROM_CLI:
+parser = argparse.ArgumentParser()
+required = parser.add_argument_group('required arguments')
+parser.add_argument('-s', metavar='platformname', type=str, default='Sentinel-3', nargs=1,
+                    help='Name of the Sentinel platform. Default: Sentinel-3',
+                    choices=['Sentinel-1', 'Sentinel-2', 'Sentinel-3', 'Sentinel-5'])
+parser.add_argument('-t', metavar='tmp_path', type=str, default='./', nargs=1,
+                    help='Path to the folder for tmp file. Default: ./')
+parser.add_argument('-o', metavar='load_path', type=str, default='./', nargs=1,
+                    help='Path to the folder for downloaded product. Default: ./')
+parser.add_argument('-c', metavar='cropped_path', type=str, default='./cropped', nargs=1,
+                    help='Path to the folder with cropped products (subsets) to check if the file was already downloaded and cropped. Default: ./cropped')
+
+parser.add_argument('-d',  metavar='days', type=str, default='2018-04-01 2018-04-01', nargs=2,
+                    help='Start date, end date YYYY-mm-dd')
+
+parser.add_argument('-p',  metavar='polygon', type=str, default="POLYGON ((3.0 54.0, 7.0 54.0, 7.0 50.0, 3.0 50.0, 3.0 54.0))", nargs=1,
+                    help='polygon in wkt format or the name of polygon from the database if it was created')
+
+parser.add_argument('-a',  metavar='credentials', type=tuple, default=('s3guest', 's3guest'), nargs=1,
+                    help='auth for copernicus sci.hub (REQUIRED for Sentinel-1, 2)')
+
+parser.add_argument('--query', action='store_true',
+                    help='Flag to do ONLY the query without downloading data')
+
+parser.add_argument('--database', action='store_true',
+                    help='Flag to write and use database file (loader.db)')
+
+args = parser.parse_args(['--query'])  # ['--query']
+if args.s[0] in ('Sentinel-1', 'Sentinel-2') and args.a == ('s3guest', 's3guest'):
+    parser.error("Sentinel-1,2 requires -a (credentials for sci.hub)")
+print(args)
 
 
 REGEX = r"(?<=<str name=\"{}\">).*(?=</str>)"
@@ -37,11 +72,7 @@ MAX_CLOUD_COVER = 90
 TYPICAL_CROPPED_LENGTH = 31
 SLSTR_PATTERN = '_SL_'
 
-TRY_RECONNECT = 3
-REQUEST_TIMEOUT = 5
-SLEEP_NOT_OK = 1800
-DOWNLOAD_TIMEOUT = 900
-SEC_2_MIN = 1 / 60
+
 B2MB = 1e-6
 
 TMP_BYTES_PATH = './loaded'
@@ -52,24 +83,32 @@ class Loader:
                  platform_name='Sentinel-3',
                  load_path='./',
                  cropped_path='./cropped',
-                 auth=('username', 'password')):
-        self.conn = sqlite3.connect('loader.db')
-        self.c = self.conn.cursor()
+                 auth=('username', 'password'),
+                 product_type_or_level=None,
+                 loader_db=LoaderDB(':memory:')):    # or 'productlevel:L1'
         self.url_dict, self.query_template = get_urls_and_query(platform_name)
         self.load_path = load_path
         self.cropped_path = cropped_path  # to check if already loaded
+        self.db = loader_db
+
         if platform_name in ('Sentinel-1', 'Sentinel-2'):
             self.url_dict['auth'] = auth
+        if product_type_or_level is None:
+            product_type_or_level= self.url_dict['producttype']
+            logger.warning('\n`product_type_or_level` was not specified. '
+                           'Default type will be used for your platform: \n{}\n'.format(product_type_or_level))
+        self.producttype = 'producttype:{}'.format(product_type_or_level)
 
     def download(self,
                  polygon='Nederland 2deg',  # or wkt
-                 period=("2018-04-01", "2018-04-01"),
-                 product_type_or_level=None):  # or 'productlevel:L1'
-        uuids, names, i_clouded = self.query_copernicus(polygon, period, product_type_or_level)
-        n_images = len(uuids)
+                 period=("2018-04-01", "2018-04-01")):
+        results = self.query_copernicus(polygon, period)
+        names = results['names']
+        uuids = results['uuids']
+        n_images = results['n_images']
         logger.info('Found {} images'.format(n_images))
         for i in range(n_images):  # for i, j in [(x, x + 1) for x in range(0, n_images, 2)]  # last one is step
-            if i in i_clouded:
+            if i in results['i_clouded']:
                 logger.warning('Too clouded - {}. Skipping'.format(names[i]))
                 continue
             if '_T29TQE_' in names[i]:  # temporal measure for S2 as I don't know TQE TTK difference
@@ -118,50 +157,13 @@ class Loader:
         url_download = self.url_dict['url_download'].format(uuid)
         auth = self.url_dict['auth']
 
-        start_f = time.time()
+        # start_f = time.time()
         logger.info('Started downloading {}'.format(uuid))
-
-        loaded = None
-        tried = 0
-        while tried < TRY_RECONNECT:
-            tried += 1
-            logger.debug('Connecting... attempt # {}'.format(tried))
-            timeout = False
-            start = time.time()
-            try:
-                r = requests.get(url_download, auth=auth, stream=True, timeout=REQUEST_TIMEOUT)
-                if not r.ok:
-                    logger.warning('Was not able to download product {}. Status code {}'.format(uuid, r.status_code))
-                    time.sleep(SLEEP_NOT_OK)
-                    continue
-                os.makedirs(os.path.dirname(tmp_bytes_path), exist_ok=True)
-                with open(tmp_bytes_path, 'wb') as tmp:
-                    for chunk in r.iter_content(chunk_size=1024):
-                        # if chunk:  # filter out keep-alive new chunks
-                        tmp.write(chunk)
-                        if time.time() - start > DOWNLOAD_TIMEOUT:
-                            r.close()
-                            logger.warning('Custom timeout on download {}'.format(tried))
-                            timeout = True
-                            break
-            except Exception as e:  # may be (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
-                passed = time.time() - start
-                logger.warning('Download product {}; exception: {}; {} seconds passed'.
-                               format(uuid, e.__class__, passed))
-                # time.sleep(SLEEP)  # time to maybe restore the connection
-                continue  # this is needed because timeout==False in case of exceptions
-
-            if not timeout:
-                with open(tmp_bytes_path, 'rb') as tmp:
-                    loaded = tmp.read()
-                    break
-
-        elapsed = round(time.time() - start_f, 2)
-        logger.debug('Elapsed \t{}\t min\n'.format(elapsed * SEC_2_MIN))
+        loaded, tried = get_request(url_download, auth, tmp_bytes_path)
 
         if loaded is None:
-            logger.error('Was not able to download product {} within {} mins, retried {} times. Final size {} MB'.
-                         format(uuid, elapsed * SEC_2_MIN, tried, os.path.getsize(tmp_bytes_path) * B2MB))
+            logger.error('Was not able to download product {} retried {} times. Final size {} MB'.
+                         format(uuid, tried, os.path.getsize(tmp_bytes_path) * B2MB))
             return
 
         if self.md5_ok(loaded, uuid):
@@ -172,38 +174,19 @@ class Loader:
         url_md5 = self.url_dict['url_md5'].format(uuid)
         logger.debug('Started MD5 for {}'.format(uuid))
 
-        md5_request, tried = self.get_request(url_md5, 'md5')
+        md5_content, tried = get_request(url_md5, self.url_dict['auth'])
 
-        if md5_request is None:
+        if md5_content is None:
             logger.fatal('MD5 sums were not downloaded after {} attempts'.format(tried))
             return False
 
         loaded_md5 = hashlib.md5(loaded_content).hexdigest()
-        expected_md5 = md5_request.text.lower()
+        expected_md5 = md5_content.decode('utf-8').lower()
 
         if loaded_md5 != expected_md5:
             logger.fatal('MD5 sums were not equal for {}'.format(uuid))
             return False
         return True
-
-    def get_request(self, url, purpose='md5'):
-        r = None
-        tried = 0
-        while r is None and tried < TRY_RECONNECT:
-            tried += 1
-            logger.debug('Connecting... attempt # {}'.format(tried))
-            try:
-                r = requests.get(url, auth=self.url_dict['auth'], timeout=REQUEST_TIMEOUT)
-                if not r.ok:
-                    logger.error('Status code {}. {} {}'.format(r.status_code, purpose.upper(), url))
-                    time.sleep(SLEEP_NOT_OK)
-                    r = None
-            except Exception as e:
-                logger.warning(
-                    'Exception: {}: {}'.format(e.__class__, purpose.upper()))
-                # time.sleep(SLEEP)  # maybe time to restore connection
-                r = None
-        return r, tried
 
     @staticmethod
     def unzip_and_save_timeout(download_request_content, unzip_path):
@@ -214,49 +197,58 @@ class Loader:
 
     def query_copernicus(self,
                          polygon='Nederland 2deg',  # or wkt
-                         period=("2018-04-01", "2018-04-01"),
-                         product_type_or_level=None):  # or 'productlevel:L1'
-        if product_type_or_level is None:
-            product_type_or_level = 'producttype:{}'.format(self.url_dict['producttype'])
-            logger.warning('\n`product_type_or_level` was not specified. '
-                           'Default type will be used for your platform: \n{}\n'.format(product_type_or_level))
-            # make levels list, suggest choice
-        uuids = []
-        names = []
-        i_clouded = []
+                         period=("2018-04-01", "2018-04-01")):
+        results = {'uuids': [],
+                   'names': [],
+                   'dates': [],
+                   'sizes': [],
+                   'n_images': 0,
+                   'clouds': [],
+                   'i_clouded': []}
 
         url_search = self.url_dict['url_search']
 
         date_start, date_end = self.__parse_period(period)
-        wkt = self.__parse_polygon(polygon)
+        if self.db:
+            wkt = self.__parse_polygon(polygon)
+        else:
+            logger.warning('Database was not selected so use wkt instead of a polygon name')
+            wkt = polygon
 
         query = self.query_template.format(polygon=wkt,
                                            date_start=date_start,
                                            date_end=date_end,
-                                           level_or_type=product_type_or_level,
+                                           level_or_type=self.producttype,
                                            start='{start}')  # to keep {start} in formatted string
         start = 0
         search = url_search + query.format(start=start)
-        r, tried = self.get_request(search, 'query')
+        # content, tried = self.get_request(search, 'query')
+        content, tried = get_request(search, self.url_dict['auth'])
 
-        if r is None:
+        if content is None:
             logger.error('Failed to get query {} after {} attempts'.format(query, tried))
-        elif re.findall(RE_NO_RESULTS, r.text):
+            return results
+        else:
+            # request_text = r.text
+            request_text = content.decode('utf-8')
+
+        if re.findall(RE_NO_RESULTS, request_text):
             logger.warning('Query returned no results.\n{}'.format(query))
         else:
-            request_text = r.text
             n_images = int(re.search(RE_N_IMAGES, request_text).group())
             logger.debug('Found {} images'.format(n_images))
             while n_images - start > 0:
                 start += MAX_REQUEST_N_IMAGES
                 search = url_search + query.format(start=start)
-                r, _ = self.get_request(search, 'query')
-                request_text += r.text
-            pol_id = self.get_pol_id(wkt)
-            dates, uuids, names, sizes = self.__parse_request_response(request_text)
-            i_clouded, clouds = self._find_clouds_s2(request_text)
-            self._insert_query(dates, uuids, names, sizes, pol_id, product_type_or_level, clouds)
-        return uuids, names, i_clouded
+                content, _ = get_request(search, self.url_dict['auth'])
+                request_text += content.decode('utf-8')
+            results = self.__parse_request_response(request_text)
+            results['i_clouded'], results['clouds'] = self._find_clouds_s2(request_text)
+            results['n_images'] = n_images
+            if self.db:
+                pol_id = self.db.get_pol_id(wkt)
+                self.db.insert_query(self.url_dict, results, pol_id, self.producttype)
+        return results
 
     @staticmethod
     def __parse_period(period):
@@ -278,9 +270,9 @@ class Loader:
     def __parse_polygon(self, polygon):
         if '(' in polygon:
             wkt = polygon
-            self.insert_polygon(polygon)
+            self.db.insert_polygon(polygon)
         else:
-            wkt = self.get_wkt_from_name(polygon)
+            wkt = self.db.get_wkt_from_name(polygon)
             if wkt is None:
                 raise Exception('Polygon with name `{}` was not found in the database. Provide correct name or just wkt'
                                 .format(polygon))
@@ -288,11 +280,13 @@ class Loader:
 
     @staticmethod
     def __parse_request_response(request_text):
-        dates = re.findall(RE_DATE, request_text)
-        uuids = re.findall(REGEX.format('uuid'), request_text)
-        names = re.findall(REGEX.format('identifier'), request_text)
-        sizes = re.findall(REGEX.format('size'), request_text)
-        return dates, uuids, names, sizes
+        results = {
+            'dates': re.findall(RE_DATE, request_text),
+            'uuids': re.findall(REGEX.format('uuid'), request_text),
+            'names': re.findall(REGEX.format('identifier'), request_text),
+            'sizes': re.findall(REGEX.format('size'), request_text)
+        }
+        return results
 
     def _find_clouds_s2(self, r_text):
         clouds = []
@@ -304,124 +298,26 @@ class Loader:
                         .format(len(i_clouded), MAX_CLOUD_COVER))
         return i_clouded, clouds
 
-    def _insert_query(self, dates, uuids, names, sizes, pol_id, product_type_or_level, clouds):
-        platforms = [self.url_dict['platformname']] * len(dates)  # list of repeats
-        levels = [product_type_or_level] * len(dates)
-        pol_ids = [pol_id] * len(dates)
-        if len(clouds) == 0:
-            clouds = ['null'] * len(dates)
-        with self.conn:
-            self.c.executemany(
-                """
-                INSERT OR IGNORE INTO query
-                (platformname, level_or_type, date, uuid, full_name, size, pol_id, clouds)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                zip(platforms, levels, dates, uuids, names, sizes, pol_ids, clouds)
-            )
-
-    def _create_query_table(self):
-        with self.conn:
-            self.c.execute(
-                """
-                CREATE TABLE IF NOT EXISTS query 
-                (
-                id INTEGER PRIMARY KEY,
-                platformname TEXT,
-                level_or_type TEXT,
-                date TEXT,
-                uuid TEXT,
-                full_name TEXT,
-                size TEXT, 
-                clouds REAL, 
-                pol_id INT REFERENCES polygons (pol_id),
-                CONSTRAINT unq UNIQUE (pol_id, uuid)
-                )
-                """
-            )
-
-    def _create_polygons_table(self):
-        with self.conn:
-            self.c.execute(
-                """
-                CREATE TABLE IF NOT EXISTS polygons 
-                (
-                pol_id INTEGER PRIMARY KEY,
-                polygon_name TEXT,
-                wkt TEXT UNIQUE,
-                CONSTRAINT unq UNIQUE (polygon_name, wkt)
-                )
-                """
-            )
-
-    def insert_polygon(self, wkt, name=""):
-        with self.conn:
-            self.c.execute(
-                """
-                INSERT OR IGNORE INTO polygons 
-                (wkt, polygon_name) 
-                VALUES (?, ?)
-                """,
-                (wkt, name)
-            )
-
-    def get_pol_id(self, wkt):
-        self.c.execute(
-            """
-            SELECT pol_id
-            FROM polygons
-            WHERE wkt = ?
-            """,
-            (wkt, )
-        )
-        res = self.c.fetchone()
-        if res is None:
-            logger.debug('Polygon {} was not found in polygons table'.format(wkt))
-        else:
-            res = res[0]  # removing tuple
-        return res
-
-    def get_wkt_from_name(self, polygon_name):
-        self.c.execute(
-            """
-            SELECT wkt
-            FROM polygons
-            WHERE polygon_name = ?
-            """,
-            (polygon_name, )
-        )
-        res = self.c.fetchone()
-        if res is None:
-            logger.debug('Polygon {} was not found in polygons table'.format(polygon_name))
-        else:
-            res = res[0]  # removing tuple
-        return res
-
-    def _insert_known_polygons(self):
-        self.insert_polygon('POLYGON ((-5.780806639544274 39.94849220488383, '
-                            '-5.765431071920511 39.94680338547788, '
-                            '-5.767758852013342 39.934209156869166,'
-                            ' -5.783131547812546 39.93589853110727, '
-                            '-5.780806639544274 39.94849220488383))', 'Majadas EC')
-        self.insert_polygon("POLYGON ((3.0 54.0, 7.0 54.0, 7.0 50.0, 3.0 50.0, 3.0 54.0))", 'Nederland 2deg')
-
 
 if __name__ == '__main__':
     """ for Sentinel-1 and 2 provide your credential in auth=('user', 'pwd')"""
     load_path_dir = r'./'
     # os.chdir(load_path)
-    loader = Loader(platform_name='Sentinel-2',
+    if args.database:
+        db = LoaderDB('loader.db')
+    else:
+        db = None
+
+    loader = Loader(platform_name='Sentinel-3',
                     load_path=load_path_dir,
-                    auth=('user', 'pwd'))
+                    auth=args.a[0],
+                    loader_db=db,
+                    product_type_or_level=None)
     # print(os.getcwd())
 
-    loader._create_polygons_table()
-    loader._insert_known_polygons()
-    loader._create_query_table()
-
-    print(loader.get_pol_id("POLYGON ((3.0 54.0, 7.0 54.0, 7.0 50.0, 3.0 50.0, 3.0 54.0))"))
-    print(loader.get_wkt_from_name('Nederland 2deg'))
-    print(loader.query_copernicus())
-
-    # names, uuids, _ = loader.query_copernicus(polygon='Majadas EC', period=('2017-04-01', '2018-08-30'))
-    loader.download(polygon='Majadas EC', period=('2017-04-01', '2018-04-01'), product_type_or_level='S2MSI2Ap')
+    if args.query:
+        # results = loader.query_copernicus(polygon='Majadas EC', period=('2017-04-01', '2018-08-30'))
+        print(loader.query_copernicus())
+    else:
+        # loader.download(polygon='Majadas EC', period=('2017-04-01', '2018-04-01'))
+        loader.download(polygon='Majadas EC', period=('2017-04-01', '2018-04-01'))
