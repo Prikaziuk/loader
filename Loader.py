@@ -289,6 +289,7 @@ if __name__ == '__main__':
                     auth=args.a[0],
                     loader_db=db,
                     product_type_or_level=None)
+
     # print(os.getcwd())
     # if args.query:
     #     # results = loader.query_copernicus(polygon='Majadas EC', period=('2017-04-01', '2018-08-30'))
