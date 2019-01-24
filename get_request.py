@@ -34,6 +34,9 @@ def get_request(url, auth, tmp_path=None):
                 if r.status_code == 401:
                     logger.critical('401 UNAUTHORIZED. Did you provide valid credentials in -a parameter?')
                     exit(-1)
+                if r.status_code == 500:
+                    logger.critical('Internal server error. Rethrowing is useless')
+                    return loaded, tried
                 logger.warning('Status code {}. Sleeping for SLEEP_NOT_OK time {}s'.format(r.status_code, SLEEP_NOT_OK))
                 time.sleep(SLEEP_NOT_OK)
                 continue

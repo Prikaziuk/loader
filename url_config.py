@@ -18,12 +18,22 @@ urls = {
             'platformname': 'Sentinel-2',
             'producttype': "S2MSI1C"
         },
-    'Sentinel-3':  # zip: folder with .nc
+    'Sentinel-3_pre':  # zip: folder with .nc
         {
             'url_search': "https://scihub.copernicus.eu/s3/search?q=",
             'auth': ('s3guest', 's3guest'),
             'url_download': "https://scihub.copernicus.eu/s3/odata/v1/Products('{}')/$value",
             'url_md5': "https://scihub.copernicus.eu/s3/odata/v1/Products('{}')/Checksum/Value/$value",
+            'platformname': 'Sentinel-3',
+            'productlevel': 'L1',
+            'producttype': "OL_1_EFR___"
+        },
+    'Sentinel-3':
+        {
+            'url_search': "https://scihub.copernicus.eu/dhus/search?q=",
+            'auth': ('', ''),
+            'url_download': "https://scihub.copernicus.eu/dhus/odata/v1/Products('{}')/$value",
+            'url_md5': "https://scihub.copernicus.eu/dhus/odata/v1/Products('{}')/Checksum/Value/$value",
             'platformname': 'Sentinel-3',
             'productlevel': 'L1',
             'producttype': "OL_1_EFR___"
