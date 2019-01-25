@@ -60,17 +60,17 @@ class Loader:
                  load_path='./',
                  cropped_path='./cropped',
                  auth=('username', 'password'),
-                 product_type_or_level=None,
+                 product_type_or_level=None,    # or 'productlevel:L1'
                  loader_db=LoaderDB(':memory:')):    # or 'productlevel:L1'
         self.url_dict, self.query_template = get_urls_and_query(platform_name)
         self.load_path = load_path
         self.cropped_path = cropped_path  # to check if already loaded
         self.db = loader_db
 
-        if platform_name in ('Sentinel-1', 'Sentinel-2'):
+        if platform_name in ('Sentinel-1', 'Sentinel-2', 'Sentinel-3'):
             self.url_dict['auth'] = auth
         if product_type_or_level is None:
-            product_type_or_level= self.url_dict['producttype']
+            product_type_or_level = self.url_dict['producttype']
             logger.warning('\n`product_type_or_level` was not specified. '
                            'Default type will be used for your platform: \n{}\n'.format(product_type_or_level))
         self.producttype = 'producttype:{}'.format(product_type_or_level)
